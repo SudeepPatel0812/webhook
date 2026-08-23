@@ -1,0 +1,6 @@
+.env 
+go.mod
+go.sum
+
+compose/data/
+compose/scripts/
