@@ -1,6 +1,9 @@
+// This file is used to specify intentionally untracked files that Git should ignore. Files already tracked by Git are not affected.
 .env 
 go.mod
 go.sum
 
 compose/data/
 compose/scripts/
+
+main
