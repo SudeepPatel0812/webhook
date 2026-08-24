@@ -12,7 +12,7 @@ import (
 func Ping() string {
 	conn, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
-		log.Fatalf("Error connecting to database: %v", err)
+		log.Printf("Error connecting to database: %v", err)
 		return "Error connecting to database"
 	}
 	defer conn.Close(context.Background())
@@ -22,7 +22,7 @@ func Ping() string {
 
 	conn.Ping(ctx)
 	if err != nil {
-		log.Fatalf("Error connecting to database: %v", err)
+		log.Printf("Error connecting to database: %v", err)
 		return "Error connecting to database"
 	}
 

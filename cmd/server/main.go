@@ -13,7 +13,6 @@ func main() {
 	port := ":8081"
 
 	config.Load()
-	db := db.Ping()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -22,8 +21,9 @@ func main() {
 	})
 
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		db := db.Ping()
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusGatewayTimeout)
 		w.Write([]byte(db))
 	})
 
