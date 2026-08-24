@@ -20,8 +20,7 @@ func Ping() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	conn.Ping(ctx)
-	if err != nil {
+	if err := conn.Ping(ctx); err != nil {
 		log.Printf("Error connecting to database: %v", err)
 		return "Error connecting to database"
 	}
