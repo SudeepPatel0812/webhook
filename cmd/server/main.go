@@ -5,7 +5,7 @@ import (
 	"net/http"
 
 	"webhook/internal/config"
-	"webhook/internal/db"
+	"webhook/internal/routes"
 )
 
 func main() {
@@ -13,19 +13,7 @@ func main() {
 	port := ":8081"
 
 	config.Load()
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		db := db.Ping()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusGatewayTimeout)
-		w.Write([]byte(db))
-	})
+	routes.SetupRoutes(mux)
 
 	if err := http.ListenAndServe(port, mux); err != nil {
 		log.Fatalf("failed to start server: %v", err)

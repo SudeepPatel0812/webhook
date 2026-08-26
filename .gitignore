@@ -7,3 +7,5 @@ compose/data/
 compose/scripts/
 
 main
+
+.DS_Store
