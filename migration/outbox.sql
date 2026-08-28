@@ -1,9 +1,0 @@
-CREATE TABLE outbox (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    application_id BIGINT NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
-    event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    processed_at TIMESTAMPTZ
-)
-
-CREATE INDEX IF NOT EXISTS idx_outbox_unprocessed ON outbox (id) WHERE processed_at IS NULL;

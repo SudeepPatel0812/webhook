@@ -96,6 +96,47 @@ Both up and down migrations are written, even for the trivial ones — it forces
 think about reversibility and makes local iteration faster while the schema is still
 moving.
 
+## pgxpool over `database/sql` + `pgx/v5/stdlib` (2026-08-28, M1 refactor)
+
+Reversing the earlier `database/sql` decision. The stated reasons for it —
+pooling, `context` support, and `SELECT ... FOR UPDATE SKIP LOCKED` for the
+relay — are all served at least as well by `pgxpool`, and it drops the
+`stdlib` driver registration and gives first-class `jsonb` handling, which
+matters because payloads are stored as `jsonb`. `database/sql`'s value is
+driver portability, and this service will only ever talk to Postgres.
+
+The connection pool sizing rationale from M0 still holds; it is now expressed
+through `pgxpool.Config` (`MaxConns`, `MaxConnLifetime`, `MaxConnIdleTime`)
+instead of the `database/sql` setters.
+
+## Idempotency key is unique per application, not globally (2026-08-28, M1 refactor)
+
+The first schema had both a standalone `UNIQUE` on `idempotency_key` and a
+composite `UNIQUE (application_id, idempotency_key)`. The standalone one is
+wrong: keys are chosen by the tenant, so two tenants can legitimately pick the
+same string. Dropped it and kept only the composite. The ingest path maps that
+constraint's violation (SQLSTATE 23505) to a domain `ErrDuplicate`, which the
+handler reports as a 200 replay rather than an error.
+
+## Config and DB helpers return errors instead of calling `log.Fatal` (2026-08-28, M1 refactor)
+
+`config.Load` and `db.New` used to `log.Fatalf` on failure. A package that
+kills the process removes the caller's ability to decide, and can't be unit
+tested. They now return `(T, error)`; `main` has a `run() error` that owns
+`os.Exit`, so every `defer` still runs on the way out.
+
+## HTTP: dependency-injected handlers, one shared pool, graceful shutdown (2026-08-28, M1 refactor)
+
+Handlers are methods on small structs that hold their dependencies as narrow
+interfaces (`EventInserter`, `Pinger`) declared at the point of use. `main` is
+the only place concrete types meet. This keeps each layer single-purpose
+(SRP), lets the ingest handler be tested with a fake store and no database,
+and inverts the dependency from handler→repository to both→interface (DIP).
+
+`main` now runs an `http.Server` with read/write/idle timeouts (a stuck client
+can't pin a connection) and drains in-flight requests on SIGINT/SIGTERM via
+`signal.NotifyContext` + `srv.Shutdown`.
+
 ## Liveness and readiness as separate endpoints (2026-08-25, M0)
 
 `/health` returns 200 unconditionally — it answers "is this process alive". `/ready`

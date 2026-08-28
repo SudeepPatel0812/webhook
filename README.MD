@@ -67,7 +67,7 @@ them to Kafka separately.
 | Observability | Prometheus (planned, M6) |
 
 Design choices and the reasoning behind them are logged in
-[`docs/decisions.md`](docs/decisions.md).
+[`DECISIONS.MD`](DECISIONS.MD).
 
 ---
 

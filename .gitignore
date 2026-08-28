@@ -1,11 +1,12 @@
-// This file is used to specify intentionally untracked files that Git should ignore. Files already tracked by Git are not affected.
-.env 
-go.mod
-go.sum
+# Intentionally untracked files.
+
+.env
 
 compose/data/
 compose/scripts/
 
+# build output
 main
+/server
 
 .DS_Store
