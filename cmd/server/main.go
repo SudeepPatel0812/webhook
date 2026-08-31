@@ -14,6 +14,7 @@ import (
 	"webhook/internal/config"
 	"webhook/internal/db"
 	"webhook/internal/repository"
+	"webhook/internal/service"
 )
 
 func main() {
@@ -41,6 +42,14 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer pool.Close()
+
+	// Run polling server at process start
+	poller := service.NewEventPollingService(pool)
+	go func() {
+		if err := poller.Polling(ctx); err != nil {
+			slog.Error("poller stopped", "err", err)
+		}
+	}()
 
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
