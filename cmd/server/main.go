@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/segmentio/kafka-go"
 
 	"webhook/internal/api"
 	"webhook/internal/config"
@@ -43,11 +47,49 @@ func run(log *slog.Logger) error {
 	}
 	defer pool.Close()
 
-	// Run polling server at process start
-	poller := service.NewEventPollingService(pool)
+	// The writer connects lazily and reconnects on leader changes, so this does
+	// no I/O. Hash balancer routes by Key, so a tenant's events keep order.
+
+	conn, err := kafka.Dial("tcp", "localhost:9092")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	controller, err := conn.Controller()
+	if err != nil {
+		panic(err.Error())
+	}
+	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	if err != nil {
+		panic(err.Error())
+	}
+	defer controllerConn.Close()
+
+	topicConfig := []kafka.TopicConfig{{
+		Topic:             "events",
+		NumPartitions:     3,
+		ReplicationFactor: 1,
+	}}
+
+	err = controllerConn.CreateTopics(topicConfig...)
+	if err != nil {
+		return err
+	}
+
+	kw := &kafka.Writer{
+		Addr:         kafka.TCP(cfg.KafkaBrokers...),
+		Topic:        "events",
+		Balancer:     &kafka.Hash{},
+		RequiredAcks: kafka.RequireAll,
+	}
+	defer kw.Close()
+
+	// Drain the outbox to Kafka for as long as the process runs.
+	poller := service.NewEventPoller(pool, kw, log)
 	go func() {
-		if err := poller.Polling(ctx); err != nil {
-			slog.Error("poller stopped", "err", err)
+		if err := poller.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("poller stopped", "err", err)
 		}
 	}()
 

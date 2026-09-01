@@ -9,5 +9,5 @@ type Outbox struct {
 	ApplicationID int64
 	EventID       int64
 	CreatedAt     time.Time
-	ProcessedAt   time.Time
+	ProcessedAt   *time.Time // nil until the event has been published
 }

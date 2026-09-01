@@ -36,6 +36,9 @@ func Load() (Config, error) {
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("config: DATABASE_URL is required")
 	}
+	if len(cfg.KafkaBrokers) == 0 {
+		return Config{}, fmt.Errorf("config: KAFKA_BROKERS is required")
+	}
 	return cfg, nil
 }
 

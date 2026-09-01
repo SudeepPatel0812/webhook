@@ -29,8 +29,17 @@ func NewEventRepository(pool *pgxpool.Pool) *EventRepository {
 }
 
 const insertEvent = `
-INSERT INTO events (application_id, event_type, payload, idempotency_key)
-VALUES ($1, $2, $3, $4)`
+		WITH event_insert AS (
+			INSERT INTO events (application_id, event_type, payload, idempotency_key)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id, application_id
+		),
+		outbox_insert AS (
+			INSERT INTO outbox (application_id, event_id)
+			SELECT application_id, id FROM event_insert
+		)
+		SELECT id FROM event_insert
+`
 
 // Insert stores an event. A unique-violation from the (application_id,
 // idempotency_key) constraint is translated to ErrDuplicate.
