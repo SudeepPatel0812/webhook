@@ -77,6 +77,7 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// kafka writer
 	kw := &kafka.Writer{
 		Addr:         kafka.TCP(cfg.KafkaBrokers...),
 		Topic:        "events",
@@ -85,11 +86,28 @@ func run(log *slog.Logger) error {
 	}
 	defer kw.Close()
 
+	// kafka reader
+	kr := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:  cfg.KafkaBrokers,
+		GroupID:  "delivery-fanout", // load-bearing: changing this re-reads the topic
+		Topic:    "events",
+		MinBytes: 1,
+		MaxBytes: 10e6, // 10MB
+	})
+	defer kr.Close()
+
 	// Drain the outbox to Kafka for as long as the process runs.
 	poller := service.NewEventPoller(pool, kw, log)
 	go func() {
 		if err := poller.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("poller stopped", "err", err)
+		}
+	}()
+
+	reader := service.NewReader(pool, kr, log)
+	go func() {
+		if err := reader.Read(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("reader stopped", "err", err)
 		}
 	}()
 

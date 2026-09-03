@@ -4,7 +4,8 @@ A multi-tenant webhook delivery service in Go. Accepts events over HTTP and deli
 them to customer-registered endpoints with at-least-once semantics, retries with
 backoff, signed payloads, and a dead letter queue.
 
-**Status: in progress.** Milestone 0 (infrastructure and service skeleton) is complete.
+**Status: in progress.** Milestones 0 through 3 are complete — infrastructure, the
+ingest API, the transactional outbox, the Kafka relay, and the dispatcher fan-out.
 See [Roadmap](#roadmap) for what's built and what isn't.
 
 ---
@@ -54,6 +55,11 @@ written in a single Postgres transaction, so there is no window where the event 
 but the message was never published. The relay picks up unpublished rows and pushes
 them to Kafka separately.
 
+The dispatcher consumes that topic and fans each event out into one `deliveries` row
+per subscribed endpoint. A `UNIQUE (event_id, endpoint_id)` constraint makes the
+fan-out idempotent, so a redelivered message — from a consumer rebalance or the relay's
+at-least-once publishing — adds nothing.
+
 ---
 
 ## Stack
@@ -101,9 +107,9 @@ curl localhost:8080/ready    # readiness — 503 if Postgres is unreachable
 ## Roadmap
 
 - [x] **M0** — Infrastructure, config, connection pooling, health/readiness, migrations
-- [ ] **M1** — Ingest API with idempotency keys, transactional outbox write
-- [ ] **M2** — Relay: outbox poller using `FOR UPDATE SKIP LOCKED`, publish to Kafka
-- [ ] **M3** — Dispatcher: Kafka consumer, idempotent fan-out to endpoints
+- [x] **M1** — Ingest API with idempotency keys, transactional outbox write
+- [x] **M2** — Relay: outbox poller using `FOR UPDATE SKIP LOCKED`, publish to Kafka
+- [x] **M3** — Dispatcher: Kafka consumer, idempotent fan-out to endpoints
 - [ ] **M4** — Delivery workers: bounded pool, HMAC signing, timeouts, graceful shutdown
 - [ ] **M5** — Retries with exponential backoff and jitter, DLQ, replay endpoint
 - [ ] **M6** — Prometheus metrics: delivery latency, attempts by status, consumer lag
