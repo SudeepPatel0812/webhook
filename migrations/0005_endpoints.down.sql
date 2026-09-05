@@ -1,1 +1,1 @@
-DROP TABLE endpoints;
+DROP TABLE endpoints
