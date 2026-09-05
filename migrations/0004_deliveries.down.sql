@@ -1,1 +1,1 @@
-DROP TABLE deliveries;
+DROP TABLE deliveries
