@@ -111,6 +111,13 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
+	delivery := service.NewDeliveryService(pool, log)
+	go func() {
+		if err := delivery.ProcessDeliveries(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error("delivery processor stopped", "err", err)
+		}
+	}()
+
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: api.NewRouter(api.Deps{

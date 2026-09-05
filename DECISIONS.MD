@@ -387,3 +387,147 @@ for due rows (`WHERE status = 'pending' AND next_attempt_at <= now()` on a parti
 index) and the throughput ceiling of a single database. Both are acceptable at this
 scale, and both have known escape hatches. Atomicity of the attempt record is the thing
 I am not willing to give up.
+
+## Claim and commit before the HTTP call, not around it (2026-09-06, M4)
+
+The delivery worker's cycle is: one `UPDATE deliveries SET status = 'processing' ...
+RETURNING` to claim a batch, then an HTTP POST per row outside any transaction, then a
+separate `UPDATE` per row to record the result. The claim is committed before the
+first POST goes out.
+
+This is the opposite of the M2 relay, which deliberately holds one transaction open
+from the `SELECT ... FOR UPDATE SKIP LOCKED` through the Kafka publish to the final
+mark. The difference is the duration of the work in the middle. A Kafka publish is
+low-single-digit milliseconds, so pinning a pooled connection across it costs nothing.
+A webhook POST is up to the full 10-second client timeout, and a batch of them runs
+concurrently — holding a transaction open per in-flight delivery would tie up a pooled
+connection for each, and worse, every one of those transactions would hold an `xmin`
+back and stall vacuum on the whole `deliveries` table for as long as the slowest
+customer endpoint takes to respond.
+
+So the claim commits immediately and the row carries its own state (`status`,
+`next_attempt_at`) instead of a lock. The cost is that the claim and the result write
+are now separate transactions with an unbounded HTTP call between them: a crash there
+leaves a row stuck in `processing` with no result recorded. That is handled by the
+visibility timeout below, not by a lock.
+
+## Visibility timeout over a reaper for claimed rows (2026-09-06, M4)
+
+A claimed row has to be invisible to other workers until its delivery finishes, and
+has to become visible again if the worker holding it dies. Two ways to do that.
+
+A status flag plus a reaper: claim sets `status = 'processing'`, and a separate
+periodic job finds rows that have been `processing` too long and resets them. That is
+a second moving part with its own schedule and its own failure modes, and the timeout
+logic lives away from the claim.
+
+A visibility timeout: the claim sets `status = 'processing'` *and* pushes
+`next_attempt_at` out by a lease (2 minutes, comfortably longer than the 10-second
+delivery timeout). The claim query's predicate is `status IN ('pending', 'processing')
+AND (next_attempt_at IS NULL OR next_attempt_at <= now())`. A row mid-delivery is
+excluded because its `next_attempt_at` is in the future; a row whose worker crashed
+becomes claimable again the moment the lease expires, with no external process
+involved. This is the SQS receive-message model.
+
+The status column stays, but as a human-readable marker for operators, not as the
+mechanism — `next_attempt_at` is what actually gates visibility. The cost is that a
+crashed delivery waits out the remaining lease before retrying (up to ~2 minutes of
+latency on that one row), where a reaper could be tuned tighter. Worth it to not run
+the reaper.
+
+## Bounded delivery pool via `errgroup.SetLimit` (2026-09-06, M4)
+
+Each batch is delivered concurrently through an `errgroup.Group` with
+`SetLimit(15)` — at most 15 POSTs in flight, the rest of the batch blocked on `g.Go`
+until a slot frees. 15 is set below the pool's `MaxConns` of 25, because every
+finished delivery does an `Exec` to record its result and must not have to wait on a
+connection.
+
+`g.Wait()` at the end of the batch means `processBatch` does not return until every
+delivery in the batch has finished and recorded — so the next tick cannot start a
+second batch on top of an unfinished one, and on `ctx` cancellation the in-flight
+deliveries run to completion (or their 10s timeout) rather than being abandoned
+mid-write.
+
+The error semantics are the subtle part. `deliver` returns `nil` for a failed HTTP
+call — a 500, a timeout, a refused connection are all normal outcomes that get written
+as `failed` and rescheduled. It returns non-nil *only* for a database error. This
+matters because `errgroup` cancels the group context on the first non-nil return: if a
+down endpoint returned an error, one customer being offline would cancel every other
+customer's in-flight delivery in the batch. HTTP health is per-endpoint and never
+propagates; database health is shared infrastructure and a failure there correctly
+aborts the batch for the next tick to retry.
+
+## Shared `http.Client`, explicit timeout, response classification (2026-09-06, M4)
+
+One `http.Client` on the service struct, reused across all deliveries, with
+`Timeout: 10s` set explicitly — the zero-value client has no timeout at all, so a
+single unresponsive endpoint would hang a worker slot forever. Each request also gets
+the errgroup's context, so shutdown and batch-abort cut in-flight calls without
+waiting out the 10 seconds. Requests carry an `X-Signature` header — HMAC-SHA256 of the
+raw payload under the endpoint's secret — so the receiver can authenticate the call.
+
+Response classification, as built: `2xx` is success, everything else — `5xx`, `4xx`,
+and transport errors alike — is a retryable failure that goes through the backoff and
+dead-letters after 5 attempts.
+
+Treating `4xx` as retryable is a deliberate simplification with a known ceiling. A
+`400` or `422` means the endpoint rejected the payload and will keep rejecting it, so
+retrying five times over an hour is wasted work on both sides; the correct behaviour is
+to fail it immediately to `dead` (keeping `408` and `429` retryable). Left out of v1
+because it needs per-status-code policy and the retry path is where I would rather be
+careful, but it is the first thing to add.
+
+## Head-of-line blocking is a known gap (2026-09-06, M4)
+
+`SetLimit(15)` is a single global cap. Nothing stops one endpoint from occupying all
+15 slots: if a customer's endpoint is slow or down and they have hundreds of pending
+deliveries, the claim query — ordered by `id` — pulls mostly their rows, and every
+worker sits on a 10-second timeout to that one host while every other tenant's
+deliveries wait. One bad endpoint degrades delivery latency for everyone.
+
+Three ways to fix it, roughly increasing in build cost:
+
+- **Per-endpoint concurrency cap.** In the claim query, `ROW_NUMBER() OVER (PARTITION
+  BY endpoint_id ORDER BY next_attempt_at)` and take only the first N rows per
+  endpoint. Cheap, entirely in SQL, and directly bounds how much of a batch any one
+  endpoint can consume.
+- **Fair scheduling.** Same window-function idea but round-robin across endpoints so
+  every endpoint with due work gets a slot each cycle regardless of backlog size.
+- **Circuit breaker.** Track consecutive failures per endpoint; once an endpoint trips,
+  skip it in the claim entirely for a cooldown and let the visibility timeout carry its
+  rows forward. Stops spending any slots on an endpoint that is clearly down.
+
+v1 ships the global cap only. The per-endpoint cap is the planned first step — it is
+a few lines in one query and removes the worst case — with the circuit breaker after
+it once there are failure-rate metrics to drive it. Recording this because it is the
+real limitation of the current design, not a hypothetical.
+
+## Deliveries are polled from Postgres, not consumed from Kafka (2026-09-06, M4)
+
+The dispatcher (M3) already writes a `deliveries` row per matching endpoint, keyed by
+`UNIQUE (event_id, endpoint_id)` for idempotency. The delivery worker then finds work
+by polling that table. The alternative is to make the worker another Kafka consumer —
+have the dispatcher also produce a per-delivery message and read those back.
+
+Polling Postgres keeps the retry state and the attempt record in one place and one
+transaction (the M3 "Postgres-backed retry queue" entry covers that reasoning). What
+this entry is about is the cost side, which is real: `deliveries` is a hot,
+frequently-updated small working set, and that is the workload Postgres's MVCC handles
+worst. Every attempt is an `UPDATE` that writes a new row version and leaves the old
+one dead; a delivery that fails four times before succeeding churns five tuples plus
+five `delivery_attempts` inserts. Under load the table bloats fast and autovacuum has
+to keep up or the partial indexes on `WHERE status = 'pending'` degrade.
+
+The scaling path, in order: tune autovacuum on `deliveries` specifically
+(`autovacuum_vacuum_scale_factor` down near zero, cost limit up) so it tracks the
+churn; partition `deliveries` by status or by created_at window so completed rows can
+be detached and dropped instead of vacuumed; and if it still does not hold, move the
+hot pending queue out to something built for it — a dedicated queue table with
+aggressive `HOT` updates, or Redis/SQS for the schedule with Postgres retained only as
+the durable attempt log. The consume-from-Kafka option comes back on the table at that
+point too, paired with a delay-topic scheme for backoff.
+
+For M4's scale — thousands of deliveries, not millions — a polling query on a partial
+index is fine, and keeping the whole thing in SQL where it can be inspected is worth
+more than pre-emptively distributing it.
