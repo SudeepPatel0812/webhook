@@ -83,13 +83,16 @@ Requires Docker and Go 1.22+.
 
 ```bash
 # start Postgres and Kafka
-docker compose -f compose/psql.yaml -f compose/kafka.yaml up -d
+docker compose -f infrastructure/infrastructure.yaml up -d
 
 # configure
 cp .env.example .env
 
 # apply schema
 migrate -path migrations -database "$DATABASE_URL" up
+
+# create Kafka topics (idempotent, safe to re-run)
+./infrastructure/scripts/create_topics.sh
 
 # run
 go run ./cmd/server

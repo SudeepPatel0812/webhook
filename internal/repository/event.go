@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"webhook/internal/domain"
@@ -28,35 +27,44 @@ func NewEventRepository(pool *pgxpool.Pool) *EventRepository {
 	return &EventRepository{pool: pool}
 }
 
+// insertEvent upserts on the idempotency constraint instead of erroring, so it
+// always has a row to RETURNING from — a fresh insert or the original on a
+// replay. `xmax = 0` is the standard trick to tell which happened: it is unset
+// (0) on a row this command actually inserted, and set to the current
+// transaction on one it only touched via the DO UPDATE. outbox_insert is
+// gated on that flag so a replay does not enqueue a second delivery.
 const insertEvent = `
 		WITH event_insert AS (
 			INSERT INTO events (application_id, event_type, payload, idempotency_key)
 			VALUES ($1, $2, $3, $4)
-			RETURNING id, application_id
+			ON CONFLICT ON CONSTRAINT events_application_id_idempotency_key_key
+			DO UPDATE SET application_id = events.application_id
+			RETURNING id, application_id, (xmax = 0) AS inserted
 		),
 		outbox_insert AS (
 			INSERT INTO outbox (application_id, event_id)
-			SELECT application_id, id FROM event_insert
+			SELECT application_id, id FROM event_insert WHERE inserted
 		)
-		SELECT id FROM event_insert
+		SELECT id, inserted FROM event_insert
 `
 
-// Insert stores an event. A unique-violation from the (application_id,
-// idempotency_key) constraint is translated to ErrDuplicate.
-func (r *EventRepository) Insert(ctx context.Context, e domain.Event) error {
+// Insert stores an event and returns its ID — the new one, or the original
+// event's ID if this is a replay of an already-stored idempotency key, paired
+// with ErrDuplicate so the caller can tell the two apart.
+func (r *EventRepository) Insert(ctx context.Context, e domain.Event) (int64, error) {
 	payload, err := json.Marshal(e.Payload)
 	if err != nil {
-		return fmt.Errorf("repository: marshal payload: %w", err)
+		return 0, fmt.Errorf("repository: marshal payload: %w", err)
 	}
 
-	_, err = r.pool.Exec(ctx, insertEvent, e.ApplicationID, e.EventType, payload, e.IdempotencyKey)
-	if err == nil {
-		return nil
+	var id int64
+	var inserted bool
+	if err := r.pool.QueryRow(ctx, insertEvent, e.ApplicationID, e.EventType, payload, e.IdempotencyKey).
+		Scan(&id, &inserted); err != nil {
+		return 0, fmt.Errorf("repository: insert event: %w", err)
 	}
-
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
-		return ErrDuplicate
+	if !inserted {
+		return id, ErrDuplicate
 	}
-	return fmt.Errorf("repository: insert event: %w", err)
+	return id, nil
 }

@@ -4,11 +4,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -47,35 +45,13 @@ func run(log *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	// The "events" topic is created out-of-band (infrastructure/scripts/create_topics.sh),
+	// the same way schema migrations are applied out-of-band rather than at boot — every
+	// replica racing kafka.CreateTopics on startup is the identical problem golang-migrate
+	// was chosen to avoid (see DECISIONS.MD).
+
 	// The writer connects lazily and reconnects on leader changes, so this does
 	// no I/O. Hash balancer routes by Key, so a tenant's events keep order.
-
-	conn, err := kafka.Dial("tcp", "localhost:9092")
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	controller, err := conn.Controller()
-	if err != nil {
-		panic(err.Error())
-	}
-	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
-	if err != nil {
-		panic(err.Error())
-	}
-	defer controllerConn.Close()
-
-	topicConfig := []kafka.TopicConfig{{
-		Topic:             "events",
-		NumPartitions:     3,
-		ReplicationFactor: 1,
-	}}
-
-	err = controllerConn.CreateTopics(topicConfig...)
-	if err != nil {
-		return err
-	}
 
 	// kafka writer
 	kw := &kafka.Writer{

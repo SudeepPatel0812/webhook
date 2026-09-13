@@ -328,37 +328,35 @@ fan-out is idempotent (entry above), a reprocessed message produces nothing new,
 commit-after is strictly the right choice: the failure mode is a harmless retry instead
 of a silent gap.
 
-## Wildcard prefix subscriptions (2026-09-04, M3)
+## Exact-match subscriptions for M3; prefix wildcards deferred (2026-09-04, M3;
+## corrected 2026-09-11)
 
-Endpoints subscribe to event types by prefix, not exact string — `order.*` matches
-`order.paid`, `order.refunded`, and anything else under `order.`. Customers integrate
-against a product area, not an enumerated list they have to keep in sync every time a
-new event type ships.
+`endpoints` has one `event_type TEXT` column, and the fan-out query
+([reader.go](internal/service/reader.go)) is a straight equality:
+`WHERE application_id = $1 AND event_type = $2` — an indexed b-tree lookup, one
+subscription per endpoint. This entry originally claimed prefix matching (`order.*`
+matching `order.paid`, `order.refunded`, …) via a join table of `(endpoint, pattern)`
+rows. Neither shipped — the migration never added the table, and the query never
+changed. Correcting the log rather than leaving a decision on record that doesn't
+match the schema.
 
-The cost is the fan-out query. Exact-match subscriptions are an indexed equality
-lookup: `WHERE application_id = $1 AND event_type = $2`, straight down a b-tree. Prefix
-matching cannot use that index the same way — it becomes a pattern match, which for a
-naive implementation means scanning every subscription for the application and testing
-each one. For now the number of endpoints per application is small enough that this is
-fine; if it stops being fine, the index is a `text_pattern_ops` b-tree on the pattern
-column, or precomputing the match set when an endpoint is registered.
+Prefix subscriptions are still the right target when there's demand for it — customers
+integrating against a product area (`order.*`) rather than an enumerated event list —
+and the design reasoning from the original entries still holds if it gets built:
 
-## Join table over `TEXT[]` for endpoint subscriptions (2026-09-04, M3)
+- A **join table**, one row per `(endpoint_id, pattern)`, over a `TEXT[]` column on
+  `endpoints`. The fan-out query goes endpoint-to-event, not event-to-endpoint, so it
+  needs an indexed join, not an array scan; a join table also gives per-subscription
+  state (a `created_at`, a paused flag) for free, and adding one subscription is a
+  single-row insert instead of rewriting an array.
+- **Matching cost.** Exact-match indexes straight down a b-tree. Prefix matching does
+  not use that index the same way without extra work — a `text_pattern_ops` index on
+  the pattern column, or precomputing the match set when an endpoint is registered are
+  the two ways to keep it indexed once endpoint counts stop being small enough for a
+  linear scan per application to be fine.
 
-An endpoint's event-type subscriptions live in their own table, one row per (endpoint,
-pattern), not as a `TEXT[]` column on `endpoints`.
-
-The array is tempting — it is one column and the whole subscription list loads with the
-endpoint. But the fan-out query goes the other way: given an event, find the endpoints
-that match. With an array that is `WHERE $1 = ANY(event_types)` or an unnest, neither of
-which indexes as cleanly as a plain b-tree on a scalar column, and prefix matching on
-array elements is worse still. Adding or removing one subscription means rewriting the
-whole array. And there is no place to hang per-subscription state — a created_at, a
-paused flag — without more array gymnastics.
-
-A join table is the normalized form of a many-to-many, and every one of those problems
-goes away: the match query is a normal indexed join, a subscription change is a
-single-row insert or delete, and per-subscription columns are just columns.
+Not on the current roadmap (M4/M5 is the delivery worker and retries); noting the
+design here so it does not have to be re-derived if it comes up.
 
 ## Postgres-backed retry queue (2026-09-04, M3)
 
@@ -531,3 +529,24 @@ point too, paired with a delay-topic scheme for backoff.
 For M4's scale — thousands of deliveries, not millions — a polling query on a partial
 index is fine, and keeping the whole thing in SQL where it can be inspected is worth
 more than pre-emptively distributing it.
+
+## Kafka topic creation via CLI, not at server startup (2026-09-11, M4)
+
+`main` used to call `kafka.Dial` for the controller and `CreateTopics` on boot, the
+same shape as the topic getting created lazily by whichever replica started first.
+That is the exact problem "Migrations via CLI, not embedded at startup" (M0) already
+ruled out for Postgres: every replica races to create the same topic on deploy, and
+whichever loses the race either errors or silently no-ops depending on the client,
+so the failure mode is nondeterministic and only shows up under concurrent startup —
+never in a single-instance dev run, which is exactly where you would not catch it.
+
+Topic creation is now `infrastructure/scripts/create_topics.sh`, run once after
+`docker compose up`, before the server — an explicit, observable step with the same
+justification as the migration CLI: a bad config (wrong partition count, wrong
+replication factor) fails visibly at that step instead of taking a boot attempt down
+with it, and `main` no longer needs a second Kafka connection (the controller dial)
+that exists for nothing but this.
+
+`--if-not-exists` makes the script idempotent, so it is safe to include in CI setup
+or run again by hand without checking state first — same property `migrate up` has
+when there is nothing new to apply.

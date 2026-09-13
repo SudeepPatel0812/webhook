@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -16,12 +17,15 @@ import (
 )
 
 const (
-	deliveryInterval   = 2 * time.Second
-	deliveryBatchSize  = 100
-	deliveryWorkers    = 15 // keep below the db pool size; each delivery does an Exec
-	deliveryTimeout    = 10 * time.Second
-	deliveryMaxRetries = 5
-	deliveryLease      = 2 * time.Minute // must exceed deliveryTimeout
+	deliveryInterval       = 2 * time.Second
+	deliveryBatchSize      = 100
+	deliveryWorkers        = 15 // keep below the db pool size; each delivery does an Exec
+	deliveryPerEndpointCap = 5  // at most this many of one endpoint's rows per batch, so a hung endpoint can't fill every worker
+	deliveryTimeout        = 10 * time.Second
+	deliveryMaxRetries     = 5
+	deliveryLease          = 2 * time.Minute // must exceed deliveryTimeout
+	backoffBase            = time.Minute
+	backoffMax             = time.Hour
 )
 
 // delivery is one row claimed for sending: where to send it, the body, and the
@@ -53,25 +57,43 @@ func NewDeliveryService(pool *pgxpool.Pool, log *slog.Logger) *DeliveryService {
 // returns everything a worker needs to send them. next_attempt_at is pushed out
 // by a short lease, so a crash mid-batch self-heals: the rows become claimable
 // again once the lease expires, with no separate reaper.
+//
+// `rn <= $3` bounds how many of any one endpoint's rows a batch can contain
+// (deliveryPerEndpointCap). Without it, one endpoint with a large backlog fills
+// the whole batch — and since deliveryWorkers is the only concurrency limit,
+// that endpoint alone can occupy every worker while every other tenant's due
+// deliveries wait behind it. The window function can't sit inside a `FOR
+// UPDATE` select (Postgres disallows combining them), so ranking happens in a
+// plain read (`ranked`/`candidates`), and SKIP LOCKED is applied afterwards, on
+// just those candidate ids (`locked`) — a candidate already claimed by a
+// concurrent worker is silently dropped there instead of blocking on it.
 const claimBatch = `
+WITH ranked AS (
+    SELECT d2.id,
+           row_number() OVER (
+               PARTITION BY d2.endpoint_id
+               ORDER BY d2.next_attempt_at NULLS FIRST, d2.id
+           ) AS rn
+    FROM deliveries d2
+    JOIN endpoints ep2 ON ep2.id = d2.endpoint_id
+    WHERE d2.completed_at IS NULL
+      AND d2.status IN ('pending', 'processing')
+      AND (d2.next_attempt_at IS NULL OR d2.next_attempt_at <= now())
+      AND ep2.is_active
+),
+candidates AS (
+    SELECT id FROM ranked WHERE rn <= $3 ORDER BY id LIMIT $1
+),
+locked AS (
+    SELECT id FROM deliveries WHERE id IN (SELECT id FROM candidates) FOR UPDATE SKIP LOCKED
+)
 UPDATE deliveries d
 SET status = 'processing',
     next_attempt_at = now() + ($2 * interval '1 second')
-FROM endpoints ep, events e
-WHERE d.endpoint_id = ep.id
+FROM endpoints ep, events e, locked l
+WHERE d.id = l.id
+  AND d.endpoint_id = ep.id
   AND d.event_id = e.id
-  AND d.id IN (
-      SELECT d2.id
-      FROM deliveries d2
-      JOIN endpoints ep2 ON ep2.id = d2.endpoint_id
-      WHERE d2.completed_at IS NULL
-        AND d2.status IN ('pending', 'processing')
-        AND (d2.next_attempt_at IS NULL OR d2.next_attempt_at <= now())
-        AND ep2.is_active
-      ORDER BY d2.id
-      LIMIT $1
-      FOR UPDATE OF d2 SKIP LOCKED
-  )
 RETURNING d.id, ep.url, ep.secret, e.payload::text, e.event_type, d.retries`
 
 const markSucceeded = `
@@ -79,16 +101,16 @@ UPDATE deliveries
 SET status = 'succeeded', completed_at = now(), last_status_code = $1
 WHERE id = $2`
 
-// markFailed advances the retry state: bump the counter, schedule an
-// exponential backoff, and dead-letter once the cap is hit.
+// markFailed bumps the retry counter and applies a status ('pending' or 'dead')
+// and next_attempt_at computed in Go by nextState — see there for why.
 const markFailed = `
 UPDATE deliveries
 SET retries = retries + 1,
     last_status_code = $1,
-    status = CASE WHEN retries + 1 >= $2 THEN 'dead' ELSE 'pending' END,
-    completed_at = CASE WHEN retries + 1 >= $2 THEN now() ELSE NULL END,
-    next_attempt_at = now() + (interval '1 minute' * power(2, retries))
-WHERE id = $3`
+    status = $2,
+    completed_at = CASE WHEN $2 = 'dead' THEN now() ELSE NULL END,
+    next_attempt_at = $3
+WHERE id = $4`
 
 const recordAttempt = `
 INSERT INTO delivery_attempts (delivery_id, attempt_number, status_code, error, duration_ms)
@@ -113,7 +135,7 @@ func (s *DeliveryService) ProcessDeliveries(ctx context.Context) error {
 }
 
 func (s *DeliveryService) processBatch(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, claimBatch, deliveryBatchSize, int(deliveryLease.Seconds()))
+	rows, err := s.pool.Query(ctx, claimBatch, deliveryBatchSize, int(deliveryLease.Seconds()), deliveryPerEndpointCap)
 	if err != nil {
 		return err
 	}
@@ -142,6 +164,47 @@ func (s *DeliveryService) processBatch(ctx context.Context) error {
 	return g.Wait()
 }
 
+// retryable reports whether a delivery outcome deserves another attempt.
+// A 4xx (other than 408/429) means the endpoint understood the request and
+// rejected it — it will reject it exactly the same way on attempt five as on
+// attempt one, so retrying just spends 30 minutes finding that out again.
+// Everything else — a transport failure (code 0), a timeout, 429, or a 5xx —
+// is assumed transient.
+func retryable(code int) bool {
+	switch {
+	case code == 0, code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
+		return true
+	case code >= 400 && code < 500:
+		return false
+	default:
+		return true
+	}
+}
+
+// nextState decides the row's next status and, for a retry, when it's next due.
+func nextState(code, attempt int) (status string, nextAttemptAt any) {
+	if retryable(code) && attempt < deliveryMaxRetries {
+		return "pending", backoff(attempt)
+	}
+	return "dead", nil
+}
+
+// backoff picks a retry time for the attempt-th failure using full jitter: a
+// uniformly random delay in [0, backoffBase*2^(attempt-1)], capped at
+// backoffMax. Without the jitter, every delivery that failed in the same tick
+// computes the identical delay from the identical formula and retries at the
+// identical instant — if that batch failed because an endpoint went down, the
+// whole batch re-arrives the moment it comes back up. Full jitter spreads
+// retries across the window instead of re-massing them on recovery.
+func backoff(attempt int) time.Time {
+	max := backoffBase * time.Duration(int64(1)<<uint(attempt-1))
+	if max > backoffMax {
+		max = backoffMax
+	}
+	delay := time.Duration(rand.Int64N(int64(max) + 1))
+	return time.Now().Add(delay)
+}
+
 // deliver sends one delivery, records the attempt, and updates the row. Only a
 // database error is returned — a failed HTTP call is a normal outcome that gets
 // scheduled for retry.
@@ -164,7 +227,8 @@ func (s *DeliveryService) deliver(ctx context.Context, d delivery) error {
 		_, err := s.pool.Exec(ctx, markSucceeded, code, d.ID)
 		return err
 	}
-	_, err := s.pool.Exec(ctx, markFailed, codeArg, deliveryMaxRetries, d.ID)
+	status, next := nextState(code, d.Retries+1)
+	_, err := s.pool.Exec(ctx, markFailed, codeArg, status, next, d.ID)
 	return err
 }
 

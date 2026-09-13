@@ -2,8 +2,8 @@
 
 .env
 
-compose/data/
-compose/scripts/
+infrastructure/data/
+infrastructure/scripts/
 
 # build output
 main

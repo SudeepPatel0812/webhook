@@ -16,7 +16,7 @@ import (
 // rather than on the concrete *repository.EventRepository (dependency
 // inversion), and so tests can supply a fake.
 type EventInserter interface {
-	Insert(ctx context.Context, e domain.Event) error
+	Insert(ctx context.Context, e domain.Event) (int64, error)
 }
 
 // EventHandler serves the event-ingest endpoint. It does one job: translate
@@ -31,6 +31,13 @@ func NewEventHandler(events EventInserter, log *slog.Logger) *EventHandler {
 }
 
 const maxBodyBytes = 1 << 20 // 1 MiB
+
+// ingestResponse is what a client gets back for a submitted event — the ID
+// they need to reference it later, on both the accepted and duplicate paths.
+type ingestResponse struct {
+	Status string `json:"status"`
+	ID     int64  `json:"id"`
+}
 
 // Ingest accepts a single event. Idempotency is keyed by the Idempotency-Key
 // header: a replay of an already-stored event returns 200 rather than an error.
@@ -47,11 +54,11 @@ func (h *EventHandler) Ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch err := h.events.Insert(r.Context(), event); {
+	switch id, err := h.events.Insert(r.Context(), event); {
 	case err == nil:
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+		writeJSON(w, http.StatusAccepted, ingestResponse{Status: "accepted", ID: id})
 	case errors.Is(err, repository.ErrDuplicate):
-		writeJSON(w, http.StatusOK, map[string]string{"status": "duplicate"})
+		writeJSON(w, http.StatusOK, ingestResponse{Status: "duplicate", ID: id})
 	default:
 		h.log.Error("ingest event", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not persist event")
