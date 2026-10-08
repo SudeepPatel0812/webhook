@@ -113,8 +113,8 @@ curl localhost:8080/ready    # readiness — 503 if Postgres is unreachable
 - [x] **M1** — Ingest API with idempotency keys, transactional outbox write
 - [x] **M2** — Relay: outbox poller using `FOR UPDATE SKIP LOCKED`, publish to Kafka
 - [x] **M3** — Dispatcher: Kafka consumer, idempotent fan-out to endpoints
-- [ ] **M4** — Delivery workers: bounded pool, HMAC signing, timeouts, graceful shutdown
-- [ ] **M5** — Retries with exponential backoff and jitter, DLQ, replay endpoint
+- [x] **M4** — Delivery workers: bounded pool, HMAC signing, timeouts, graceful shutdown
+- [x] **M5** — Retries with exponential backoff and jitter, DLQ, replay endpoint
 - [ ] **M6** — Prometheus metrics: delivery latency, attempts by status, consumer lag
 - [ ] **M8** — Load testing and measured throughput/latency numbers
 

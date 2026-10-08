@@ -11,9 +11,10 @@ import (
 // expressed as narrow interfaces so handlers can be tested without a database
 // and main stays the only place concrete types are wired together.
 type Deps struct {
-	Events EventInserter
-	DB     Pinger
-	Log    *slog.Logger
+	Events     EventInserter
+	Deliveries DeliveryReplayer
+	DB         Pinger
+	Log        *slog.Logger
 }
 
 // NewRouter builds the HTTP handler: routes plus request logging.
@@ -21,10 +22,12 @@ func NewRouter(d Deps) http.Handler {
 	mux := http.NewServeMux()
 
 	events := NewEventHandler(d.Events, d.Log)
+	deliveries := NewDeliveryHandler(d.Deliveries, d.Log)
 
 	mux.HandleFunc("GET /health", health)
 	mux.HandleFunc("GET /ready", ready(d.DB))
 	mux.HandleFunc("POST /v1/events", events.Ingest)
+	mux.HandleFunc("POST /v1/deliveries/{id}/replay", deliveries.Replay)
 
 	return requestLogger(d.Log)(mux)
 }

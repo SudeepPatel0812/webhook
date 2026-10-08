@@ -87,8 +87,13 @@ func run(log *slog.Logger) error {
 		}
 	}()
 
+	// deliveriesDone closes once ProcessDeliveries has returned, which it only
+	// does after its in-flight deliveries finish. Shutdown waits on it so the
+	// deferred pool.Close doesn't pull the pool out from under their final writes.
 	delivery := service.NewDeliveryService(pool, log)
+	deliveriesDone := make(chan struct{})
 	go func() {
+		defer close(deliveriesDone)
 		if err := delivery.ProcessDeliveries(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("delivery processor stopped", "err", err)
 		}
@@ -97,9 +102,10 @@ func run(log *slog.Logger) error {
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: api.NewRouter(api.Deps{
-			Events: repository.NewEventRepository(pool),
-			DB:     pool,
-			Log:    log,
+			Events:     repository.NewEventRepository(pool),
+			Deliveries: delivery,
+			DB:         pool,
+			Log:        log,
 		}),
 		// Timeouts so a slow or stuck client can't hold a connection open
 		// indefinitely and starve the server.
@@ -125,6 +131,8 @@ func run(log *slog.Logger) error {
 		log.Info("shutdown signal received, draining connections")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		err := srv.Shutdown(shutdownCtx)
+		<-deliveriesDone // bounded by deliveryTimeout plus the bookkeeping writes
+		return err
 	}
 }

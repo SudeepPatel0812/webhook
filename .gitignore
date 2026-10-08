@@ -3,7 +3,6 @@
 .env
 
 infrastructure/data/
-infrastructure/scripts/
 
 # build output
 main

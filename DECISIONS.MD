@@ -476,6 +476,9 @@ to fail it immediately to `dead` (keeping `408` and `429` retryable). Left out o
 because it needs per-status-code policy and the retry path is where I would rather be
 careful, but it is the first thing to add.
 
+*Update (M5): done. `retryable(code)` sends a 4xx other than 408/429 straight to
+`dead`; transport errors, 408, 429 and 5xx still retry.*
+
 ## Head-of-line blocking is a known gap (2026-09-06, M4)
 
 `SetLimit(15)` is a single global cap. Nothing stops one endpoint from occupying all
@@ -500,6 +503,9 @@ v1 ships the global cap only. The per-endpoint cap is the planned first step —
 a few lines in one query and removes the worst case — with the circuit breaker after
 it once there are failure-rate metrics to drive it. Recording this because it is the
 real limitation of the current design, not a hypothetical.
+
+*Update (M5): the per-endpoint cap shipped — see "Per-endpoint cap in the claim query"
+below, and the Little's law entry after it for what the cap does and does not fix.*
 
 ## Deliveries are polled from Postgres, not consumed from Kafka (2026-09-06, M4)
 
@@ -550,3 +556,152 @@ that exists for nothing but this.
 `--if-not-exists` makes the script idempotent, so it is safe to include in CI setup
 or run again by hand without checking state first — same property `migrate up` has
 when there is nothing new to apply.
+## Per-endpoint cap in the claim query (2026-10-08, M5)
+
+This closes the head-of-line gap logged in M4. The claim query ranks due rows within
+each endpoint and takes at most `deliveryPerEndpointCap` (2) of each:
+
+```sql
+row_number() OVER (PARTITION BY d3.endpoint_id ORDER BY d3.id) AS rn
+...
+WHERE rn <= $3
+```
+
+An endpoint with 10,000 rows backed up now gets the same two slots per batch as one
+with a single row due. A hung endpoint can tie up at most two of the 15 workers, not
+all of them.
+
+Postgres does not allow a window function in the same `SELECT` as `FOR UPDATE`, so
+the query has two levels. The inner query ranks the rows as a plain read. The outer
+query locks just those candidate ids with `FOR UPDATE ... SKIP LOCKED`. A candidate
+that another worker has already claimed is dropped at the lock step instead of
+blocking, so this is still safe with more than one replica.
+
+Within an endpoint, rows are taken in `id` order (oldest first). The other option was
+`next_attempt_at` order (most overdue first). I went with `id` because a retry that
+has waited a long time can still sit behind newer first attempts with lower ids, but
+only within the same endpoint, and only up to two rows at a time. Fair scheduling
+across endpoints matters more than strict ordering inside one.
+
+The circuit breaker from the M4 entry is still not built. A hung endpoint now wastes
+two slots instead of fifteen, but it still wastes two on every batch until its rows
+go to `dead`. A circuit breaker is the fix for that, once there are failure-rate
+metrics (M6) to trigger it.
+
+## Sizing the delivery worker with Little's law (2026-10-08, M5)
+
+Little's law: **L = λW**. The average number of items in a system (L) equals the
+arrival rate (λ) times the average time each item spends in it (W). For the delivery
+worker, L is deliveries in flight, λ is deliveries completed per second, and W is
+how long one HTTP POST takes. Rearranged, **λ = L / W**: throughput is concurrency
+divided by latency. That one line explains both why the per-endpoint cap matters
+and where the real limit of the current design is.
+
+**The variables in this design:**
+
+| | | |
+|---|---|---|
+| N | workers (`deliveryWorkers`) | 15 |
+| B | batch limit (`deliveryBatchSize`) | 100 |
+| C | per-endpoint cap | 2 |
+| E | endpoints with due work | depends on traffic |
+| T | tick interval (`deliveryInterval`) | 2s |
+| W | per-request latency | 200ms healthy, 10s at the timeout |
+
+Rows claimed per tick: R = min(B, C·E). In flight: L = min(N, R). `processBatch`
+waits on `g.Wait()` for the whole batch, so a batch takes about D = ⌈R/N⌉ × W, and
+it takes as long as its slowest row. The ticker drops ticks while a batch runs, so
+the cycle time is roughly max(T, D). Throughput is λ ≈ R / max(T, D).
+
+**Worked numbers:**
+
+- *5 endpoints, all healthy (W = 200ms):* R = min(100, 2·5) = 10. The batch is done
+  in 0.2s, then the worker sits idle until the next tick. λ = 10 / 2s = **5/s**. The
+  limit is the tick interval, not the workers.
+- *50 endpoints, all healthy:* R = 100, ⌈100/15⌉ = 7 rounds × 0.2s = 1.4s. That
+  still fits inside one tick, so λ = 100 / 2s = **50/s**.
+- *50 endpoints, one hung (W = 10s):* its two rows hold two workers for the full 10s
+  timeout. The other 98 rows finish in about 1.6s on the remaining 13 workers. But
+  `g.Wait()` holds the batch open until the hung rows time out, so D = 10s and
+  λ = 100 / 10s = **10/s**.
+- *Same hung endpoint, no per-endpoint cap (the M4 behaviour):* its backlog fills
+  the whole batch. That's 100 rows across 15 workers at 10s each, ⌈100/15⌉ × 10s =
+  70s per batch, so λ ≈ **1.4/s**, and every one of those deliveries is to the dead
+  endpoint. Healthy tenants get nothing.
+
+So the cap does what it is meant to. With one hung endpoint, throughput is 10/s
+instead of 1.4/s, and healthy tenants are served on every batch instead of starved.
+But the last two cases also show what the cap does **not** fix: `g.Wait()` is a
+barrier. One slow row still holds the whole batch open, so a hung endpoint costs
+5× throughput (50/s → 10/s) even though it only uses two workers.
+
+**What this says the real ceiling is.** With C = 2 and T = 2s, the claim gives at
+most C·E / T = E deliveries per second, whatever N is. Adding workers does nothing
+when there are few endpoints, because there aren't enough claimed rows to keep them
+busy. For λ = 100/s at W = 300ms, Little's law gives N = λW = 30 workers. But
+filling 30 workers each tick also needs R = λT = 200 claimed rows, which means
+B ≥ 200 and C·E ≥ 200, or 100 endpoints with due work at C = 2. The worker count is
+not the limit here. The tick-and-barrier cycle is.
+
+**Database connections.** Little's law applies to the pool as well. A delivery only
+holds a connection for its two `Exec`s (record the attempt, mark the row), roughly
+2–5ms, not for the HTTP call. At 50/s that is 50 × 0.005s ≈ 0.25 connections in use
+on average. The comment on `deliveryWorkers` ("keep below the db pool size") is more
+cautious than it needs to be. Workers do not hold a connection while they wait on
+HTTP, so N can go well above `MaxConns` = 25 before the pool is a bottleneck.
+
+**Next step.** Replace the tick-and-barrier cycle with a continuous loop: claim as
+many rows as there are free worker slots, start each delivery as soon as a slot
+opens, and claim again straight away when a claim comes back full. With no
+`g.Wait()` barrier, a hung row ties up one worker instead of the whole batch. With
+no tick cap, throughput can actually reach N/W. That loop also changes what the
+per-endpoint cap has to measure. Today "2 per batch" and "2 in flight" are the same
+thing, because the barrier means nothing from the last batch is still running. In a
+continuous loop they are not, so the claim has to skip endpoints that already have C
+rows in `processing` with an unexpired lease. *Built; see the next entry.*
+
+## Continuous claim loop instead of tick-and-batch (2026-10-08, M5)
+
+Built the next step from the Little's law entry. `ProcessDeliveries` no longer runs a
+batch on a 2s ticker and waits on `g.Wait()`. It is now a single loop with a
+15-slot semaphore:
+
+1. Count free workers. Claim that many rows, no more.
+2. Start each claimed delivery in its own goroutine right away. When one finishes,
+   it frees its slot and signals the loop.
+3. If the claim filled every free slot, there is probably more work waiting, so wait
+   for the next free slot and claim again. If it came back short, nothing else is
+   due yet, so wait `deliveryIdlePoll` (2s) and look again.
+
+There is no barrier any more. A delivery hung on a 10s timeout holds its own worker
+and nothing else. The other workers keep finishing, freeing slots and claiming. In
+the earlier case of 50 endpoints with one hung, throughput goes from 10/s (the
+barrier holds every batch for 10s) back to about 13 workers / 0.2s ≈ 65/s. When
+the backlog is large, the 2s tick no longer caps throughput, because the loop
+claims again as soon as a worker frees up.
+
+**The per-endpoint cap now counts rows in flight.** With no barrier, "2 per claim"
+no longer means "2 at once". A hung endpoint would get 2 more rows on every claim and
+fill every worker one claim at a time. The claim query now has a `busy` CTE that
+counts each endpoint's `processing` rows whose lease hasn't expired, and only gives
+that endpoint `cap - busy` more. Tested on real data: an endpoint already at 2 got
+none, an endpoint at 1 got 1, and every endpoint ended at exactly 2. The cap is exact
+within one process, because claims run one at a time and each commits before the next
+starts. Two replicas claiming at the same moment can both read the same `busy` count
+and briefly go over. That is acceptable for a fairness limit that is meant to be soft.
+
+**`errgroup` is gone.** Its job was to bound concurrency per batch and cancel the
+batch on a DB error. A semaphore channel bounds concurrency, and with no batch there
+is nothing to cancel. A failed bookkeeping write is logged, and the row's lease
+brings it back. The "one bad endpoint cancels the batch" problem from M4 can no
+longer happen, because there is no shared group context.
+
+**Shutdown actually drains now.** The M4 entry said in-flight deliveries "run to
+completion" on cancellation. That was not true: they ran on the errgroup's context,
+which was derived from the shutdown context, so SIGTERM cut every POST off
+immediately and left the rows for the lease to recover. Now deliveries run on
+`context.WithoutCancel(ctx)`. On SIGTERM the loop stops claiming, `ProcessDeliveries`
+waits for in-flight deliveries (each bounded by the 10s client timeout), and `main`
+waits for `ProcessDeliveries` to return before its deferred `pool.Close()`. Otherwise
+the pool would close underneath their final writes.
+
