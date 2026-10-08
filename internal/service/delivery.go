@@ -26,6 +26,8 @@ const (
 	deliveryLease          = 2 * time.Minute // must exceed deliveryTimeout
 	backoffBase            = time.Minute
 	backoffMax             = time.Hour
+	breakerThreshold       = 5           // consecutive retryable failures that open an endpoint's circuit
+	breakerCooldown        = time.Minute // how long an open circuit waits before letting one test delivery through
 )
 
 // ErrDeliveryNotFound means Replay was asked to reset a delivery id that
@@ -35,12 +37,13 @@ var ErrDeliveryNotFound = errors.New("delivery not found")
 // delivery is one row claimed for sending: where to send it, the body, and the
 // retry count so far.
 type delivery struct {
-	ID        int64
-	URL       string
-	Secret    string
-	Payload   string
-	EventType string
-	Retries   int
+	ID         int64
+	EndpointID int64
+	URL        string
+	Secret     string
+	Payload    string
+	EventType  string
+	Retries    int
 }
 
 type DeliveryService struct {
@@ -62,18 +65,25 @@ func NewDeliveryService(pool *pgxpool.Pool, log *slog.Logger) *DeliveryService {
 // by a lease ($2 seconds), so a crash mid-delivery self-heals: the row becomes
 // claimable again once the lease expires, with no separate reaper.
 //
-// The per-endpoint cap ($3) counts rows already in flight, not just rows in
-// this claim. `busy` counts each endpoint's 'processing' rows whose lease
-// hasn't expired; an endpoint can only get `$3 - busy` more. So an endpoint
-// with 2 deliveries hanging on a 10s timeout gets nothing until one finishes,
-// however many times the loop claims in the meantime.
+// Each endpoint gets a cap that depends on its circuit:
+//   - closed: $3 (deliveryPerEndpointCap)
+//   - open, still cooling down: 0, so the endpoint is skipped entirely
+//   - open, cooldown ($4 seconds) has passed: 1, a single test delivery
+//
+// The cap counts rows already in flight: `busy` counts each endpoint's
+// 'processing' rows whose lease hasn't expired, and an endpoint only gets
+// `cap - busy` more. That makes the cap exact within one process.
+//
+// `probes` makes the single test delivery exact across replicas too. Handing
+// out a test restarts the endpoint's cooldown (circuit_opened_at = now()) in
+// the same statement. If two replicas race for the same endpoint, Postgres
+// serialises their UPDATEs on that endpoint row; the second re-checks the
+// cooldown against the first one's new timestamp, matches nothing, and its
+// candidate row for that endpoint is dropped from `locked`.
 //
 // The window function can't sit inside a `FOR UPDATE` select (Postgres
-// disallows combining them), so ranking happens in an inner plain read, and
-// SKIP LOCKED is applied by the outer select on just those candidate ids.
-// The cap is exact within one process (claims are sequential, and each commits
-// before the next starts); two replicas claiming at the same instant can each
-// see the same `busy` count and briefly exceed it.
+// disallows combining them), so ranking happens in a plain read
+// (`candidates`), and SKIP LOCKED is applied afterwards on just those ids.
 const claimBatch = `
 WITH busy AS (
     SELECT endpoint_id, count(*) AS n
@@ -81,24 +91,43 @@ WITH busy AS (
     WHERE status = 'processing' AND next_attempt_at > now()
     GROUP BY endpoint_id
 ),
+candidates AS (
+    SELECT ranked.id, ranked.endpoint_id, ranked.circuit_state
+    FROM (
+        SELECT d3.id, d3.endpoint_id, ep.circuit_state,
+               row_number() OVER (PARTITION BY d3.endpoint_id ORDER BY d3.id) AS rn,
+               CASE
+                   WHEN ep.circuit_state = 'closed' THEN $3
+                   WHEN ep.circuit_opened_at <= now() - ($4 * interval '1 second') THEN 1
+                   ELSE 0
+               END AS cap
+        FROM deliveries d3
+        JOIN endpoints ep ON ep.id = d3.endpoint_id
+        WHERE d3.status IN ('pending', 'processing')
+          AND d3.completed_at IS NULL
+          AND (d3.next_attempt_at IS NULL OR d3.next_attempt_at <= now())
+          AND ep.is_active
+    ) ranked
+    LEFT JOIN busy b ON b.endpoint_id = ranked.endpoint_id
+    WHERE ranked.rn <= ranked.cap - COALESCE(b.n, 0)
+    ORDER BY ranked.id
+    LIMIT $1
+),
+probes AS (
+    UPDATE endpoints
+    SET circuit_opened_at = now()
+    WHERE id IN (SELECT endpoint_id FROM candidates WHERE circuit_state = 'open')
+      AND circuit_state = 'open'
+      AND circuit_opened_at <= now() - ($4 * interval '1 second')
+    RETURNING id
+),
 locked AS (
     SELECT d2.id
     FROM deliveries d2
     WHERE d2.id IN (
-        SELECT ranked.id FROM (
-            SELECT d3.id, d3.endpoint_id,
-                   row_number() OVER (PARTITION BY d3.endpoint_id ORDER BY d3.id) AS rn
-            FROM deliveries d3
-            JOIN endpoints ep ON ep.id = d3.endpoint_id
-            WHERE d3.status IN ('pending', 'processing')
-              AND d3.completed_at IS NULL
-              AND (d3.next_attempt_at IS NULL OR d3.next_attempt_at <= now())
-              AND ep.is_active
-        ) ranked
-        LEFT JOIN busy b ON b.endpoint_id = ranked.endpoint_id
-        WHERE ranked.rn <= $3 - COALESCE(b.n, 0)
-        ORDER BY ranked.id
-        LIMIT $1
+        SELECT id FROM candidates
+        WHERE circuit_state = 'closed'
+           OR endpoint_id IN (SELECT id FROM probes)
     )
     FOR UPDATE OF d2 SKIP LOCKED
 )
@@ -109,7 +138,36 @@ FROM endpoints ep, events e, locked l
 WHERE d.id = l.id
   AND d.endpoint_id = ep.id
   AND d.event_id = e.id
-RETURNING d.id, ep.url, ep.secret, e.payload::text, e.event_type, d.retries`
+RETURNING d.id, d.endpoint_id, ep.url, ep.secret, e.payload::text, e.event_type, d.retries`
+
+// breakerSuccess closes the circuit and clears the failure count. The WHERE
+// skips the write when there is nothing to change, so a healthy endpoint
+// doesn't get a new row version on every successful delivery.
+const breakerSuccess = `
+UPDATE endpoints
+SET consecutive_failures = 0, circuit_state = 'closed', circuit_opened_at = NULL
+WHERE id = $1 AND (consecutive_failures <> 0 OR circuit_state <> 'closed')`
+
+// breakerFailure counts one more failure. Reaching the threshold opens a closed
+// circuit and counts a trip. Any failure while the circuit is already open (a
+// failed test delivery, or a late one that was in flight when it tripped)
+// restarts the cooldown. Every SET expression reads the row's old values.
+const breakerFailure = `
+UPDATE endpoints
+SET consecutive_failures = consecutive_failures + 1,
+    circuit_state = CASE
+        WHEN circuit_state = 'open' OR consecutive_failures + 1 >= $2 THEN 'open'
+        ELSE 'closed'
+    END,
+    circuit_opened_at = CASE
+        WHEN circuit_state = 'open' OR consecutive_failures + 1 >= $2 THEN now()
+        ELSE circuit_opened_at
+    END,
+    circuit_trips = circuit_trips + CASE
+        WHEN circuit_state = 'closed' AND consecutive_failures + 1 >= $2 THEN 1
+        ELSE 0
+    END
+WHERE id = $1`
 
 const markSucceeded = `
 UPDATE deliveries
@@ -217,7 +275,7 @@ func (s *DeliveryService) ProcessDeliveries(ctx context.Context) error {
 
 // claim marks up to n due deliveries as 'processing' and returns them.
 func (s *DeliveryService) claim(ctx context.Context, n int) ([]delivery, error) {
-	rows, err := s.pool.Query(ctx, claimBatch, n, int(deliveryLease.Seconds()), deliveryPerEndpointCap)
+	rows, err := s.pool.Query(ctx, claimBatch, n, int(deliveryLease.Seconds()), deliveryPerEndpointCap, int(breakerCooldown.Seconds()))
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +283,7 @@ func (s *DeliveryService) claim(ctx context.Context, n int) ([]delivery, error) 
 	var batch []delivery
 	for rows.Next() {
 		var d delivery
-		if err := rows.Scan(&d.ID, &d.URL, &d.Secret, &d.Payload, &d.EventType, &d.Retries); err != nil {
+		if err := rows.Scan(&d.ID, &d.EndpointID, &d.URL, &d.Secret, &d.Payload, &d.EventType, &d.Retries); err != nil {
 			return nil, err
 		}
 		batch = append(batch, d)
@@ -271,9 +329,10 @@ func backoff(attempt int) time.Time {
 	return time.Now().Add(delay)
 }
 
-// deliver sends one delivery, records the attempt, and updates the row. Only a
-// database error is returned — a failed HTTP call is a normal outcome that gets
-// scheduled for retry.
+// deliver sends one delivery, records the attempt, updates the row, then feeds
+// the outcome to the endpoint's circuit breaker. Only a database error is
+// returned — a failed HTTP call is a normal outcome that gets scheduled for
+// retry.
 func (s *DeliveryService) deliver(ctx context.Context, d delivery) error {
 	start := time.Now()
 	code, httpErr := s.post(ctx, d)
@@ -290,11 +349,29 @@ func (s *DeliveryService) deliver(ctx context.Context, d delivery) error {
 	}
 
 	if httpErr == nil && code/100 == 2 {
-		_, err := s.pool.Exec(ctx, markSucceeded, code, d.ID)
+		if _, err := s.pool.Exec(ctx, markSucceeded, code, d.ID); err != nil {
+			return err
+		}
+	} else {
+		status, next := nextState(code, d.Retries+1)
+		if _, err := s.pool.Exec(ctx, markFailed, codeArg, status, next, d.ID); err != nil {
+			return err
+		}
+	}
+	return s.recordHealth(ctx, d.EndpointID, code)
+}
+
+// recordHealth updates the endpoint's circuit breaker. Only failures that say
+// the endpoint is unhealthy count: no response at all (code 0), a timeout, a
+// 429, or a 5xx — the same set retryable() treats as transient. Any other
+// response, including a permanent 4xx, shows the endpoint is up and answering,
+// so it counts as healthy.
+func (s *DeliveryService) recordHealth(ctx context.Context, endpointID int64, code int) error {
+	if retryable(code) && code/100 != 2 {
+		_, err := s.pool.Exec(ctx, breakerFailure, endpointID, breakerThreshold)
 		return err
 	}
-	status, next := nextState(code, d.Retries+1)
-	_, err := s.pool.Exec(ctx, markFailed, codeArg, status, next, d.ID)
+	_, err := s.pool.Exec(ctx, breakerSuccess, endpointID)
 	return err
 }
 

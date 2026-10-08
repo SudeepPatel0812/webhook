@@ -583,7 +583,7 @@ has waited a long time can still sit behind newer first attempts with lower ids,
 only within the same endpoint, and only up to two rows at a time. Fair scheduling
 across endpoints matters more than strict ordering inside one.
 
-The circuit breaker from the M4 entry is still not built. A hung endpoint now wastes
+*Update: the circuit breaker is built — see "Circuit breaker per endpoint" below.* The circuit breaker from the M4 entry was not built at this point. A hung endpoint now wastes
 two slots instead of fifteen, but it still wastes two on every batch until its rows
 go to `dead`. A circuit breaker is the fix for that, once there are failure-rate
 metrics (M6) to trigger it.
@@ -704,4 +704,52 @@ immediately and left the rows for the lease to recover. Now deliveries run on
 waits for in-flight deliveries (each bounded by the 10s client timeout), and `main`
 waits for `ProcessDeliveries` to return before its deferred `pool.Close()`. Otherwise
 the pool would close underneath their final writes.
+
+## Circuit breaker per endpoint (2026-10-08, M5)
+
+The per-endpoint cap limits a dead endpoint to 2 workers, but it keeps using
+those 2 for as long as it has due rows, each attempt waiting out the 10s
+timeout. The circuit breaker stops sending to an endpoint that is clearly down.
+
+**State lives on `endpoints`** (migration 0007): `circuit_state` (`closed` or
+`open`), `circuit_opened_at`, `consecutive_failures`, and `circuit_trips` (how
+many times it has opened, for metrics later).
+
+**What counts as a failure.** Only outcomes that say the endpoint itself is
+unhealthy: no response at all, a timeout, a 429, or a 5xx. That is the same set
+`retryable()` treats as transient. A permanent 4xx (400, 404, 422) counts as
+healthy for the breaker: the endpoint is up and answering, it is only rejecting
+that payload. Those deliveries already go straight to `dead`, so they waste no
+retries anyway.
+
+**Transitions**, written after every attempt:
+- A failure adds 1 to `consecutive_failures`. At 5 in a row the circuit opens.
+- A success (or any healthy response) resets the count to 0 and closes the
+  circuit. That write is skipped when there is nothing to change, so a healthy
+  endpoint does not get a new row version on every delivery.
+- Any failure while the circuit is open restarts the cooldown.
+
+**The claim query enforces it.** Each endpoint's cap comes from its circuit:
+2 when closed, 0 while open and cooling down, 1 once the 1-minute cooldown has
+passed. Because the cap counts deliveries in flight, the half-open endpoint gets
+exactly one test delivery, and nothing more until that test finishes. A
+successful test closes the circuit; a failed one restarts the cooldown.
+
+**Exactly one test across replicas.** In-flight counting alone is exact only
+within one process: two replicas claiming at the same moment could each send a
+test. So handing out a test also restarts the endpoint's cooldown
+(`circuit_opened_at = now()`) in the same statement, through an `UPDATE` with
+the cooldown check in its `WHERE`. Postgres serialises updates to that one
+endpoint row. The second replica waits for the first to commit, re-checks the
+cooldown against the new timestamp, matches nothing, and drops its candidate for
+that endpoint. Tested with two concurrent sessions on a scratch database: the
+second waited on the first's lock and the endpoint got one test delivery.
+
+**Deliveries for an open endpoint just wait.** They stay `pending` and are not
+claimed, so they do not spend any of their 5 retries while the endpoint is
+down. When the circuit closes they go out in the normal way, still capped at 2
+in flight.
+
+Not built yet: exponential growth of the cooldown for an endpoint that keeps
+failing its tests, and alerting on `circuit_trips`. Both want the M6 metrics.
 
