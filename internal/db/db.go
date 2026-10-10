@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"webhook/internal/telemetry"
 )
 
 // New opens a Postgres connection pool and verifies it with a ping. The returned
@@ -26,6 +28,7 @@ func New(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	cfg.MinConns = 2
 	cfg.MaxConnLifetime = 5 * time.Minute
 	cfg.MaxConnIdleTime = time.Minute
+	cfg.ConnConfig.Tracer = telemetry.QueryTracer{}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

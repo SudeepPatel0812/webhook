@@ -15,6 +15,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"webhook/internal/telemetry"
 )
 
 const (
@@ -44,6 +49,7 @@ type delivery struct {
 	Payload    string
 	EventType  string
 	Retries    int
+	EventID    int64
 }
 
 type DeliveryService struct {
@@ -54,10 +60,22 @@ type DeliveryService struct {
 
 func NewDeliveryService(pool *pgxpool.Pool, log *slog.Logger) *DeliveryService {
 	return &DeliveryService{
-		pool:   pool,
-		client: &http.Client{Timeout: deliveryTimeout},
+		pool: pool,
+		// Keep up to one idle connection per worker for each host. Go's default
+		// of 2 means a busy endpoint gets a fresh TCP (and TLS) handshake on
+		// most POSTs once more than 2 workers are talking to it.
+		client: &http.Client{Timeout: deliveryTimeout, Transport: deliveryTransport()},
 		log:    log,
 	}
+}
+
+// deliveryTransport is Go's default transport (proxy, dial and TLS timeouts,
+// idle-connection expiry, HTTP/2) with room for one idle connection per worker
+// to each host.
+func deliveryTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = deliveryWorkers
+	return t
 }
 
 // claimBatch atomically marks up to $1 due deliveries as 'processing' and
@@ -84,7 +102,7 @@ func NewDeliveryService(pool *pgxpool.Pool, log *slog.Logger) *DeliveryService {
 // The window function can't sit inside a `FOR UPDATE` select (Postgres
 // disallows combining them), so ranking happens in a plain read
 // (`candidates`), and SKIP LOCKED is applied afterwards on just those ids.
-const claimBatch = `
+const claimBatch = `-- name: claim_deliveries
 WITH busy AS (
     SELECT endpoint_id, count(*) AS n
     FROM deliveries
@@ -138,12 +156,12 @@ FROM endpoints ep, events e, locked l
 WHERE d.id = l.id
   AND d.endpoint_id = ep.id
   AND d.event_id = e.id
-RETURNING d.id, d.endpoint_id, ep.url, ep.secret, e.payload::text, e.event_type, d.retries`
+RETURNING d.id, d.endpoint_id, d.event_id, ep.url, ep.secret, e.payload::text, e.event_type, d.retries`
 
 // breakerSuccess closes the circuit and clears the failure count. The WHERE
 // skips the write when there is nothing to change, so a healthy endpoint
 // doesn't get a new row version on every successful delivery.
-const breakerSuccess = `
+const breakerSuccess = `-- name: breaker_record_success
 UPDATE endpoints
 SET consecutive_failures = 0, circuit_state = 'closed', circuit_opened_at = NULL
 WHERE id = $1 AND (consecutive_failures <> 0 OR circuit_state <> 'closed')`
@@ -152,7 +170,7 @@ WHERE id = $1 AND (consecutive_failures <> 0 OR circuit_state <> 'closed')`
 // circuit and counts a trip. Any failure while the circuit is already open (a
 // failed test delivery, or a late one that was in flight when it tripped)
 // restarts the cooldown. Every SET expression reads the row's old values.
-const breakerFailure = `
+const breakerFailure = `-- name: breaker_record_failure
 UPDATE endpoints
 SET consecutive_failures = consecutive_failures + 1,
     circuit_state = CASE
@@ -167,16 +185,17 @@ SET consecutive_failures = consecutive_failures + 1,
         WHEN circuit_state = 'closed' AND consecutive_failures + 1 >= $2 THEN 1
         ELSE 0
     END
-WHERE id = $1`
+WHERE id = $1
+RETURNING consecutive_failures = $2 AS tripped`
 
-const markSucceeded = `
+const markSucceeded = `-- name: mark_delivery_succeeded
 UPDATE deliveries
 SET status = 'succeeded', completed_at = now(), last_status_code = $1
 WHERE id = $2`
 
 // markFailed bumps the retry counter and applies a status ('pending' or 'dead')
 // and next_attempt_at computed in Go by nextState — see there for why.
-const markFailed = `
+const markFailed = `-- name: mark_delivery_failed
 UPDATE deliveries
 SET retries = retries + 1,
     last_status_code = $1,
@@ -185,7 +204,7 @@ SET retries = retries + 1,
     next_attempt_at = $3
 WHERE id = $4`
 
-const recordAttempt = `
+const recordAttempt = `-- name: record_delivery_attempt
 INSERT INTO delivery_attempts (delivery_id, attempt_number, status_code, error, duration_ms)
 VALUES ($1, $2, $3, $4, $5)`
 
@@ -193,7 +212,7 @@ VALUES ($1, $2, $3, $4, $5)`
 // status — dead, still failing, or already succeeded (a customer asking for a
 // resend) — so the next claim picks it up immediately. last_status_code is
 // left as-is; the next attempt overwrites it.
-const replayDelivery = `
+const replayDelivery = `-- name: replay_delivery
 UPDATE deliveries
 SET status = 'pending', retries = 0, completed_at = NULL, next_attempt_at = NULL
 WHERE id = $1`
@@ -214,10 +233,9 @@ func (s *DeliveryService) Replay(ctx context.Context, id int64) error {
 // ProcessDeliveries runs a continuous claim loop until ctx is cancelled. It
 // claims as many rows as there are free workers and starts each delivery as
 // soon as it is claimed; there is no batch barrier, so one slow delivery holds
-// up only its own worker. When a claim fills every free worker there is
-// probably more work waiting, so the loop claims again as soon as a worker
-// frees up. When a claim comes back short, nothing more is due yet, so it
-// waits deliveryIdlePoll before looking again.
+// up only its own worker. While deliveries are in flight it claims again each
+// time one finishes; when nothing is in flight and a claim comes back short,
+// nothing is due, so it waits deliveryIdlePoll before looking again.
 //
 // On cancellation it stops claiming and waits for in-flight deliveries to
 // finish. They run on a context detached from ctx, so a shutdown doesn't cut a
@@ -232,7 +250,6 @@ func (s *DeliveryService) ProcessDeliveries(ctx context.Context) error {
 
 	for {
 		free := deliveryWorkers - len(sem)
-		claimed := 0
 		if free > 0 {
 			batch, err := s.claim(ctx, free)
 			if err != nil && ctx.Err() == nil {
@@ -241,8 +258,10 @@ func (s *DeliveryService) ProcessDeliveries(ctx context.Context) error {
 			for _, d := range batch {
 				sem <- struct{}{} // never blocks: only this goroutine acquires, and len(batch) <= free
 				wg.Add(1)
+				telemetry.DeliveriesInFlight.Inc()
 				go func() {
 					defer wg.Done()
+					defer telemetry.DeliveriesInFlight.Dec()
 					defer func() {
 						<-sem
 						select {
@@ -255,20 +274,35 @@ func (s *DeliveryService) ProcessDeliveries(ctx context.Context) error {
 					}
 				}()
 			}
-			claimed = len(batch)
 		}
 
-		// Saturated: every worker is busy, or the last claim filled every free
-		// one. Wake as soon as a worker frees up. Otherwise just poll.
+		// While anything is in flight, wake as soon as a delivery finishes: that
+		// frees a worker, and it also frees a slot under its endpoint's cap, so
+		// rows the last claim had to leave behind may be claimable now. A short
+		// claim doesn't mean nothing is due — it often means every endpoint
+		// with due work was already at its cap. Only when nothing is in flight
+		// does a short claim mean there's nothing to do, so then just poll.
 		var wake <-chan struct{}
-		if free == 0 || claimed == free {
+		if len(sem) > 0 {
 			wake = freed
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-wake:
+			drain(freed) // several deliveries finishing together need only one claim
 		case <-time.After(deliveryIdlePoll):
+		}
+	}
+}
+
+// drain empties ch without blocking.
+func drain(ch <-chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
 		}
 	}
 }
@@ -283,7 +317,7 @@ func (s *DeliveryService) claim(ctx context.Context, n int) ([]delivery, error) 
 	var batch []delivery
 	for rows.Next() {
 		var d delivery
-		if err := rows.Scan(&d.ID, &d.EndpointID, &d.URL, &d.Secret, &d.Payload, &d.EventType, &d.Retries); err != nil {
+		if err := rows.Scan(&d.ID, &d.EndpointID, &d.EventID, &d.URL, &d.Secret, &d.Payload, &d.EventType, &d.Retries); err != nil {
 			return nil, err
 		}
 		batch = append(batch, d)
@@ -333,10 +367,51 @@ func backoff(attempt int) time.Time {
 // the outcome to the endpoint's circuit breaker. Only a database error is
 // returned — a failed HTTP call is a normal outcome that gets scheduled for
 // retry.
-func (s *DeliveryService) deliver(ctx context.Context, d delivery) error {
+//
+// Each attempt is its own trace, with the POST and every query as children, so
+// it shows exactly which step failed and how long each took. The span carries
+// event.id and delivery.id: searching Tempo for either finds every attempt,
+// next to the ingest request and fan-out for the same event.
+func (s *DeliveryService) deliver(ctx context.Context, d delivery) (err error) {
+	ctx, span := telemetry.Tracer.Start(ctx, "delivery.attempt",
+		trace.WithAttributes(
+			attribute.Int64("event.id", d.EventID),
+			attribute.Int64("delivery.id", d.ID),
+			attribute.Int64("endpoint.id", d.EndpointID),
+			attribute.String("event.type", d.EventType),
+			attribute.Int("delivery.attempt", d.Retries+1),
+		))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	start := time.Now()
 	code, httpErr := s.post(ctx, d)
-	durMs := time.Since(start).Milliseconds()
+	elapsed := time.Since(start)
+	durMs := elapsed.Milliseconds()
+
+	// Decide the outcome from the response alone, before any bookkeeping, so
+	// the attempt is counted correctly even if a database write below fails.
+	succeeded := httpErr == nil && code/100 == 2
+	result, status, next := "succeeded", "", any(nil)
+	if !succeeded {
+		status, next = nextState(code, d.Retries+1)
+		result = "retry"
+		if status == "dead" {
+			result = "dead"
+		}
+	}
+	class := telemetry.StatusClass(code, httpErr != nil)
+	telemetry.Observe(ctx, telemetry.DeliveryDuration.WithLabelValues(class), elapsed.Seconds())
+	telemetry.DeliveryAttempts.WithLabelValues(result, class).Inc()
+	span.SetAttributes(attribute.String("delivery.result", result))
+	if !succeeded {
+		span.SetStatus(codes.Error, "delivery "+result)
+	}
 
 	var codeArg, errArg any
 	if httpErr != nil {
@@ -347,16 +422,12 @@ func (s *DeliveryService) deliver(ctx context.Context, d delivery) error {
 	if _, err := s.pool.Exec(ctx, recordAttempt, d.ID, d.Retries+1, codeArg, errArg, durMs); err != nil {
 		return err
 	}
-
-	if httpErr == nil && code/100 == 2 {
+	if succeeded {
 		if _, err := s.pool.Exec(ctx, markSucceeded, code, d.ID); err != nil {
 			return err
 		}
-	} else {
-		status, next := nextState(code, d.Retries+1)
-		if _, err := s.pool.Exec(ctx, markFailed, codeArg, status, next, d.ID); err != nil {
-			return err
-		}
+	} else if _, err := s.pool.Exec(ctx, markFailed, codeArg, status, next, d.ID); err != nil {
+		return err
 	}
 	return s.recordHealth(ctx, d.EndpointID, code)
 }
@@ -368,8 +439,16 @@ func (s *DeliveryService) deliver(ctx context.Context, d delivery) error {
 // so it counts as healthy.
 func (s *DeliveryService) recordHealth(ctx context.Context, endpointID int64, code int) error {
 	if retryable(code) && code/100 != 2 {
-		_, err := s.pool.Exec(ctx, breakerFailure, endpointID, breakerThreshold)
-		return err
+		var tripped bool
+		if err := s.pool.QueryRow(ctx, breakerFailure, endpointID, breakerThreshold).Scan(&tripped); err != nil {
+			return err
+		}
+		if tripped {
+			telemetry.CircuitOpens.Inc()
+			trace.SpanFromContext(ctx).AddEvent("circuit opened", trace.WithAttributes(attribute.Int64("endpoint.id", endpointID)))
+			s.log.Warn("circuit opened", "endpoint_id", endpointID, "trace_id", telemetry.TraceID(ctx))
+		}
+		return nil
 	}
 	_, err := s.pool.Exec(ctx, breakerSuccess, endpointID)
 	return err
@@ -377,11 +456,30 @@ func (s *DeliveryService) recordHealth(ctx context.Context, endpointID int64, co
 
 // post makes the HTTP request and returns the status code. A non-nil error
 // means the request never completed (timeout, connection refused, …).
-func (s *DeliveryService) post(ctx context.Context, d delivery) (int, error) {
+//
+// The span records only the endpoint's host, not its full URL: customers often
+// put a token in the path or query string. The trace context is not sent to
+// the customer either; it is internal.
+func (s *DeliveryService) post(ctx context.Context, d delivery) (code int, err error) {
+	ctx, span := telemetry.Tracer.Start(ctx, "webhook.post", trace.WithSpanKind(trace.SpanKindClient))
+	defer func() {
+		if code != 0 {
+			span.SetAttributes(attribute.Int("http.response.status_code", code))
+		}
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else if code >= 400 {
+			span.SetStatus(codes.Error, http.StatusText(code))
+		}
+		span.End()
+	}()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.URL, strings.NewReader(d.Payload))
 	if err != nil {
 		return 0, err
 	}
+	span.SetAttributes(attribute.String("http.request.method", http.MethodPost), attribute.String("server.address", req.URL.Hostname()))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Event-Type", d.EventType)
 	req.Header.Set("X-Signature", sign(d.Secret, d.Payload))

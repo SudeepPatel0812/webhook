@@ -55,5 +55,49 @@ services:
       POSTGRES_DB: postgres
     ports:
       - "5432:5432"
+  # --- Observability: metrics (Prometheus), traces (Tempo), dashboards (Grafana) ---
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Keeps the trace ids attached to histogram samples, so Grafana can link
+      # a latency point to its trace.
+      - --enable-feature=exemplar-storage
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      # Lets Prometheus reach the service running on the host, on Linux too.
+      - "host.docker.internal:host-gateway"
+
+  tempo:
+    image: grafana/tempo:2.7.0
+    command: ["-config.file=/etc/tempo.yaml"]
+    user: "0" # the image's default user can't write to a fresh volume
+    ports:
+      - "3200:3200" # query API
+      - "4318:4318" # OTLP over HTTP, where the service sends spans
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
+  grafana:
+    image: grafana/grafana:11.5.0
+    ports:
+      - "3000:3000"
+    environment:
+      # Local only: open Grafana without a login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - tempo
+
 volumes:
   kafka-data:
+  tempo-data:

@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"webhook/internal/domain"
 	"webhook/internal/repository"
 )
@@ -54,7 +57,16 @@ func (h *EventHandler) Ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch id, err := h.events.Insert(r.Context(), event); {
+	id, err := h.events.Insert(r.Context(), event)
+	// event.id on the request span is what ties this trace to the publish,
+	// fan-out and delivery traces for the same event.
+	if id != 0 {
+		trace.SpanFromContext(r.Context()).SetAttributes(
+			attribute.Int64("event.id", id),
+			attribute.Bool("event.duplicate", errors.Is(err, repository.ErrDuplicate)),
+		)
+	}
+	switch {
 	case err == nil:
 		writeJSON(w, http.StatusAccepted, ingestResponse{Status: "accepted", ID: id})
 	case errors.Is(err, repository.ErrDuplicate):

@@ -33,7 +33,7 @@ func NewEventRepository(pool *pgxpool.Pool) *EventRepository {
 // (0) on a row this command actually inserted, and set to the current
 // transaction on one it only touched via the DO UPDATE. outbox_insert is
 // gated on that flag so a replay does not enqueue a second delivery.
-const insertEvent = `
+const insertEvent = `-- name: insert_event
 		WITH event_insert AS (
 			INSERT INTO events (application_id, event_type, payload, idempotency_key)
 			VALUES ($1, $2, $3, $4)

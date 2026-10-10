@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: webhook-service
+    folder: Webhook Service
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

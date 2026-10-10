@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/segmentio/kafka-go"
 
 	"webhook/internal/api"
@@ -17,6 +18,7 @@ import (
 	"webhook/internal/db"
 	"webhook/internal/repository"
 	"webhook/internal/service"
+	"webhook/internal/telemetry"
 )
 
 func main() {
@@ -35,6 +37,21 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// Tracing is on only when OTEL_EXPORTER_OTLP_ENDPOINT is set. Shutdown is
+	// deferred first so it runs last, after the delivery worker has drained,
+	// and flushes every span still buffered.
+	shutdownTracing, err := telemetry.Setup(context.Background(), cfg.OTLPEndpoint)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Error("flush traces", "err", err)
+		}
+	}()
+
 	// SIGINT/SIGTERM cancels this context, which drives graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -44,6 +61,8 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer pool.Close()
+	telemetry.RegisterQueueDepth(pool)
+	telemetry.RegisterPoolStats(pool)
 
 	// The "events" topic is created out-of-band (infrastructure/scripts/create_topics.sh),
 	// the same way schema migrations are applied out-of-band rather than at boot — every
@@ -59,6 +78,11 @@ func run(log *slog.Logger) error {
 		Topic:        "events",
 		Balancer:     &kafka.Hash{},
 		RequiredAcks: kafka.RequireAll,
+		// The poller hands over a whole batch per WriteMessages call, so there
+		// is nothing to wait for. The 1s default made every write wait a full
+		// second for a partition's batch to fill: a second of latency on every
+		// event, and publishing capped near 100 events/s.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	defer kw.Close()
 
@@ -71,6 +95,13 @@ func run(log *slog.Logger) error {
 		MaxBytes: 10e6, // 10MB
 	})
 	defer kr.Close()
+
+	// How far the fan-out consumer is behind the newest event on the topic.
+	// Stats() also resets the reader's message counters; nothing else reads them.
+	prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "webhook_kafka_consumer_lag",
+		Help: "Messages on the events topic not yet consumed by the fan-out reader.",
+	}, func() float64 { return float64(kr.Stats().Lag) }))
 
 	// Drain the outbox to Kafka for as long as the process runs.
 	poller := service.NewEventPoller(pool, kw, log)

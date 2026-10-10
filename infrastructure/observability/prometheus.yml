@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # The service runs on the host (go run ./cmd/server), not in compose, so
+  # Prometheus reaches it through host.docker.internal. PORT is 8081 locally
+  # because kafka-ui already has 8080.
+  - job_name: webhook-service
+    static_configs:
+      - targets: ["host.docker.internal:8081"]

@@ -15,6 +15,9 @@ type Config struct {
 	Port         string
 	DatabaseURL  string
 	KafkaBrokers []string
+	// OTLPEndpoint is where traces are sent, e.g. http://localhost:4318. Empty
+	// turns tracing off; metrics are always on.
+	OTLPEndpoint string
 }
 
 // Load reads configuration from the process environment, loading a .env file
@@ -31,6 +34,7 @@ func Load() (Config, error) {
 		Port:         envOr("PORT", "8080"),
 		DatabaseURL:  os.Getenv("DATABASE_URL"),
 		KafkaBrokers: splitList(os.Getenv("KAFKA_BROKERS")),
+		OTLPEndpoint: os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 	}
 
 	if cfg.DatabaseURL == "" {

@@ -753,3 +753,106 @@ in flight.
 Not built yet: exponential growth of the cooldown for an endpoint that keeps
 failing its tests, and alerting on `circuit_trips`. Both want the M6 metrics.
 
+## Metrics and traces: low-cardinality labels, detail on spans (2026-10-10, M6)
+
+Prometheus metrics, OpenTelemetry traces in Tempo, and Grafana on top, all in
+the compose file. The rule that keeps the data readable: **a metric label only
+gets values from a small fixed set**. Route pattern (never the raw path), query
+name, method, status code, outcome, response class. Anything per tenant or per
+row (application id, endpoint id, delivery id, event id, error text) creates a
+new time series per value, and would grow without limit. Those go on spans,
+where high cardinality is fine. Histograms attach the trace id as an exemplar,
+so a point on a latency chart opens the trace behind it.
+
+**Every query has a name.** Each SQL constant starts with `-- name: <name>`, and
+a pgx `QueryTracer` reads it for every Exec, Query and QueryRow. Each query is
+counted by name and outcome and timed. A missing name falls into one
+`unnamed` bucket rather than a label per SQL string. The SQL text and the
+arguments are never recorded: the text is a constant you can find by name, and
+the arguments hold customer payloads.
+
+**No traces for idle work.** The claim loop queries every 2s, the outbox poller
+every 500ms, and Prometheus scrapes `/metrics` every 5s. Tracing all of that
+would bury the real traffic in empty one-span traces. So:
+- a query span is created only inside a span that is already recording, so the
+  idle claim and poll queries are counted but not traced;
+- the poller starts its publish spans only when the batch is non-empty;
+- `/metrics`, `/health` and `/ready` are counted but not traced.
+
+**One trace per stage, joined by `event.id`.** The outbox and the deliveries
+table are async hops through Postgres. Carrying one trace across them would
+mean storing a traceparent on each row, and I decided against adding columns
+for it. Each stage gets its own trace instead:
+- the ingest request, with its `insert_event` query;
+- publish and fan-out, joined through a `traceparent` Kafka header;
+- each delivery attempt, with the POST and every bookkeeping query as children.
+
+Every one of those spans carries `event.id`, so a Tempo search for one event
+returns all of them, and delivery spans also carry `delivery.id` and
+`endpoint.id`. The cost is a search instead of a single waterfall per event.
+
+**What the customer endpoint sees.** The POST span records only the endpoint's
+host, not its full URL, because customers often put a token in the path or
+query. The trace context is not sent to the customer either.
+
+**Sampling.** Every trace is kept by default, which is right locally. In
+production, set `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and
+`OTEL_TRACES_SAMPLER_ARG=0.1`; the SDK reads both. Metrics are unaffected by
+sampling, so counts and rates stay exact.
+
+## Load test: what broke at 5k, 10k and 50k events (2026-10-10, M6)
+
+Ran `cmd/loadgen` at 5k, 10k and 50k events against 15 endpoints on
+`cmd/sink`, each sink path a scenario (healthy, realistic mix, slow, always
+down, gone). Endpoints are set up by `infrastructure/scripts/seed_loadtest.sql`.
+Each run surfaced a limit the metrics or a trace made visible.
+
+**Fixed:**
+
+- **Claim loop slept with work waiting.** A claim that came back with fewer
+  rows than free workers was read as "nothing due", so the loop slept 2s. But
+  it was usually short because each endpoint was already at its in-flight cap:
+  5 endpoints × 2 rows per 2s, which works out to about 5 deliveries/s while
+  the sink answered in ~1ms. Now the loop
+  claims again whenever a delivery finishes, as long as anything is in flight,
+  and sleeps only when nothing is. Delivery went from ~9/s to 300–400/s.
+- **Outbox capped at 200 events/s.** The poller took one batch of 100 per
+  500ms tick. It now keeps draining while batches come back full.
+- **Every Kafka write waited 1 second.** kafka-go's default `BatchTimeout` is
+  1s, and with 3 partitions a 100-event batch never filled a partition's batch,
+  so each write waited out the timer. A trace showed it: `outbox.publish` took
+  1,028ms and fan-out started only at the end. `BatchTimeout` is now 10ms.
+  Publishing went to ~3,300 events/s.
+- **Two idle connections per host.** Go's default HTTP transport keeps 2 idle
+  connections per host, so most POSTs to a busy endpoint opened a new
+  connection. The delivery client now keeps one per worker.
+- **Traces weren't reaching Tempo.** `OTEL_EXPORTER_OTLP_ENDPOINT` is a base
+  URL, and spans were posted to `/` instead of `/v1/traces`.
+- **Tempo dropped 42% of spans** at its default of 10,000 traces in memory;
+  raised for local use.
+- **The load generator** closed responses without reading them, so it never
+  reused a connection. At 50k requests that overflowed the OS connection
+  queue and 3,166 requests failed. Not a service problem.
+
+**Results after the fixes, 50k events:** ingest 7,000–7,800 events/s with no
+failures; outbox publishing ~3,300/s; fan-out cleared a 43,000-message Kafka
+lag in ~30s. The "down" endpoint tripped its circuit and waited behind it
+without spending retries, and the "slow" endpoint drained 2 at a time
+without holding anyone else up.
+
+**Not fixed, and now the limits:**
+
+- **The claim query reads the whole backlog.** To pick 2 rows per endpoint, it
+  scans and sorts every due delivery: 46,151 rows for 30 candidates, 26ms, and
+  linear in the backlog. With one claim at a time, delivery falls to
+  ~150/s at 50k queued. The fix is an index on
+  `deliveries (endpoint_id, id) WHERE completed_at IS NULL` and a `LATERAL`
+  read of the first few due rows per endpoint, which makes a claim cost
+  proportional to endpoints instead of backlog.
+- **One pool for everything.** During a 50k burst, 52,684 queries waited for a
+  connection (3.8ms average), and one trace showed a delivery's bookkeeping
+  stuck ~11s behind ingest. Ingest, fan-out, the claim loop and delivery
+  workers share 25 connections. Separate pools for the API and the
+  background workers, or PgBouncer in front, would stop an ingest burst from
+  starving delivery.
+

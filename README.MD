@@ -107,6 +107,35 @@ curl localhost:8080/ready    # readiness — 503 if Postgres is unreachable
 
 ---
 
+## Observability
+
+The compose file also starts Prometheus, Tempo and Grafana.
+
+| | URL |
+|---|---|
+| Grafana (dashboard: Webhook Service) | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| Raw metrics | http://localhost:8081/metrics |
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` in `.env` to send traces
+to Tempo. To follow one event end to end, search Tempo for `{ span.event.id = 123 }`:
+it returns the ingest request, the publish and fan-out, and every delivery attempt.
+On the latency charts, the dots are exemplars; click one to open that trace.
+
+### Load test
+
+```bash
+psql "$DATABASE_URL" -f infrastructure/scripts/seed_loadtest.sql   # 15 endpoints, one scenario each
+go run ./cmd/sink                                                  # fake customer endpoints on :9000
+go run ./cmd/loadgen -n 50000 -c 50 -apps 1,2,4
+```
+
+The sink's paths are scenarios: `/ok`, `/mixed` (200, 204, 500, 503, 404,
+dropped connections, slow, timeouts), `/slow`, `/down` (trips the circuit
+breaker), `/gone` (410, dead on the first attempt). See `cmd/sink/main.go`.
+
+---
+
 ## Roadmap
 
 - [x] **M0** — Infrastructure, config, connection pooling, health/readiness, migrations
@@ -115,7 +144,7 @@ curl localhost:8080/ready    # readiness — 503 if Postgres is unreachable
 - [x] **M3** — Dispatcher: Kafka consumer, idempotent fan-out to endpoints
 - [x] **M4** — Delivery workers: bounded pool, HMAC signing, timeouts, graceful shutdown
 - [x] **M5** — Retries with exponential backoff and jitter, DLQ, replay endpoint
-- [ ] **M6** — Prometheus metrics: delivery latency, attempts by status, consumer lag
+- [x] **M6** — Prometheus metrics: delivery latency, attempts by status, consumer lag
 - [ ] **M8** — Load testing and measured throughput/latency numbers
 
 ---
